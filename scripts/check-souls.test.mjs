@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, describe, test } from 'node:test';
@@ -338,6 +338,31 @@ describe('checkRepository', () => {
     assert.deepEqual(fixture({}), []);
   });
 
+  test('reports a root that does not exist by the name it is given', () => {
+    const missing = join(tmpdir(), 'check-souls-no-such-dir');
+    assert.deepEqual(checkRepository(missing, 'no-such-dir'), {
+      problems: ['no-such-dir: directory not found'],
+      fileCount: 0,
+      ruleCount: 0,
+    });
+    assert.deepEqual(checkRepository(missing).problems, [`${missing}: directory not found`]);
+  });
+
+  test(
+    'reports a root that cannot be looked up by the name it is given',
+    { skip: process.platform === 'win32' ? 'creating a symbolic link needs extra rights on Windows' : false },
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'check-souls-loop-'));
+      roots.push(dir);
+      symlinkSync('loop', join(dir, 'loop'));
+      assert.deepEqual(checkRepository(join(dir, 'loop'), 'loop'), {
+        problems: ['loop: cannot read (ELOOP)'],
+        fileCount: 0,
+        ruleCount: 0,
+      });
+    },
+  );
+
   test('reports a guide without the requirements table', () => {
     const problems = fixture({ 'CONTRIBUTING.md': '# Guide\n\nNo table here.\n' });
     assert.equal(problems.length, 1);
@@ -529,6 +554,9 @@ describe('readRules and readSections', () => {
 
 describe('command line', () => {
   const script = join(repoRoot, 'scripts', 'check-souls.mjs');
+  // A working directory beside the temporary roots. The summary names a root inside the working
+  // directory by its relative path, so a test that expects a temporary root's absolute path runs
+  // from here: the temporary directory can be inside the repository.
   const elsewhere = mkdtempSync(join(tmpdir(), 'check-souls-cwd-'));
   after(() => rmSync(elsewhere, { recursive: true, force: true }));
 
@@ -578,7 +606,7 @@ describe('command line', () => {
         join(broken, soul),
         GOOD_USE_CASE.replace('name: helper\n', '').replace('## Harm Avoidance\n', ''),
       );
-      const { status, stdout } = run(['--root', broken]);
+      const { status, stdout } = run(['--root', broken], elsewhere);
       assert.equal(status, 1);
       assert.deepEqual(stdout.split('\n'), [
         'souls/by-use-case/helper.md: missing frontmatter field `name`',
@@ -600,7 +628,7 @@ describe('command line', () => {
       writeFileSync(join(single, 'CONTRIBUTING.md'), GUIDE.split('| By Fleet, member |')[0]);
       writeFileSync(join(single, 'README.md'), '[helper](souls/by-use-case/helper.md)\n');
       writeFileSync(join(single, soul), GOOD_USE_CASE.replace('## Harm Avoidance\n', ''));
-      const { status, stdout } = run(['--root', single]);
+      const { status, stdout } = run(['--root', single], elsewhere);
       assert.equal(status, 1);
       assert.deepEqual(stdout.split('\n'), [
         'souls/by-use-case/helper.md: missing section ## Harm Avoidance',
@@ -613,17 +641,68 @@ describe('command line', () => {
   });
 
   test('reports a directory without CONTRIBUTING.md and exits 1', () => {
-    const { status, stdout } = run(['--root', elsewhere]);
+    const empty = mkdtempSync(join(tmpdir(), 'check-souls-empty-'));
+    try {
+      const { status, stdout } = run(['--root', empty], elsewhere);
+      assert.equal(status, 1);
+      assert.deepEqual(stdout.split('\n'), [
+        'CONTRIBUTING.md: file not found',
+        `Checked 0 files in ${empty} against 0 rules from CONTRIBUTING.md: 1 problem.`,
+        '',
+      ]);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
+  test('reports a --root directory that does not exist and exits 1', () => {
+    const { status, stdout } = run(['--root', 'no-such-dir'], elsewhere);
     assert.equal(status, 1);
     assert.deepEqual(stdout.split('\n'), [
-      'CONTRIBUTING.md: file not found',
-      `Checked 0 files in ${elsewhere} against 0 rules from CONTRIBUTING.md: 1 problem.`,
+      'no-such-dir: directory not found',
+      'Checked 0 files in no-such-dir against 0 rules from CONTRIBUTING.md: 1 problem.',
       '',
     ]);
   });
 
+  test('reports a --root that is a file and exits 1', () => {
+    const { status, stdout } = run(['--root', 'README.md']);
+    assert.equal(status, 1);
+    assert.deepEqual(stdout.split('\n'), [
+      'README.md: not a directory',
+      'Checked 0 files in README.md against 0 rules from CONTRIBUTING.md: 1 problem.',
+      '',
+    ]);
+  });
+
+  test(
+    'reports a --root that is a symbolic link loop and exits 1',
+    { skip: process.platform === 'win32' ? 'creating a symbolic link needs extra rights on Windows' : false },
+    () => {
+      symlinkSync('loop', join(elsewhere, 'loop'));
+      const { status, stdout, stderr } = run(['--root', 'loop'], elsewhere);
+      assert.equal(status, 1);
+      assert.deepEqual(stdout.split('\n'), [
+        'loop: cannot read (ELOOP)',
+        'Checked 0 files in loop against 0 rules from CONTRIBUTING.md: 1 problem.',
+        '',
+      ]);
+      assert.equal(stderr, '');
+    },
+  );
+
+  test('help states the exit status for a --root directory that does not exist', () => {
+    assert.match(run(['--help']).stdout, /1 problems found, including a --root\s+directory that does not exist/);
+  });
+
   test('names the root relative to the working directory when it is inside it', () => {
     assert.match(run([]).stdout, / files in \. against /);
+  });
+
+  test('names a root below the working directory by its relative path', () => {
+    mkdirSync(join(elsewhere, 'nested', 'root'), { recursive: true });
+    const { stdout } = run(['--root', 'nested/root'], elsewhere);
+    assert.ok(stdout.includes(' files in nested/root against '), stdout);
   });
 
   test('names the root by its absolute path when run from outside it', () => {
