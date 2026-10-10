@@ -28,10 +28,26 @@ const HACKMYAGENT = scannerCommand(process.env.HACKMYAGENT);
 
 // Returns the spawnSync arguments that run a command's words. On Windows `npx` is npx.cmd, which Node
 // starts only through a shell, so there the words are joined into one cmd.exe command line, with each
-// word that contains spaces quoted.
+// word escaped by windowsWord.
 function scannerSpawn(words, platform = process.platform) {
   if (platform !== 'win32') return [words[0], words.slice(1), {}];
-  return [words.map((word) => (/\s/.test(word) ? `"${word}"` : word)).join(' '), [], { shell: true }];
+  return [words.map(windowsWord).join(' '), [], { shell: true }];
+}
+
+// cmd.exe treats these characters as special outside double quotes, so a word that contains one is quoted.
+const CMD_QUOTED = /[\s&|<>^(),;=]/;
+// cmd.exe still expands %name% inside double quotes, and a double quote inside a word would end the
+// quoted part early. In a word that contains one of these, every quote and special character is escaped
+// with ^ instead, so cmd.exe never enters a quoted part and passes each one on literally.
+const CMD_ESCAPED = /["%]/;
+
+// Returns a word as cmd.exe passes it to the program as one argument. The program reads backslashes
+// literally except before a double quote, where each pair is one backslash, so backslashes before a
+// quote or the closing quote are doubled and a quote in the word is written \".
+function windowsWord(word) {
+  if (word && !CMD_QUOTED.test(word) && !CMD_ESCAPED.test(word)) return word;
+  const quoted = `"${word.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, '$1$1')}"`;
+  return CMD_ESCAPED.test(word) ? quoted.replace(/[ \t"%&|<>^(),;=]/g, '^$&') : quoted;
 }
 
 // A scan still running after this long is stopped, so a scanner or an npx download that hangs fails the
@@ -228,7 +244,16 @@ describe('scanSoulProblems', () => {
       'telemetry',
       `if (process.env.OPENA2A_TELEMETRY === 'off') process.stdout.write(${JSON.stringify(passing)});\n`,
     );
-    assert.deepEqual(scanSoulProblems(scanner, souls), []);
+    // Turned on here, so the scanner sees off only because scanSoulProblems sets it, not because the
+    // shell running the tests exported OPENA2A_TELEMETRY=off.
+    const previous = process.env.OPENA2A_TELEMETRY;
+    process.env.OPENA2A_TELEMETRY = 'on';
+    try {
+      assert.deepEqual(scanSoulProblems(scanner, souls), []);
+    } finally {
+      if (previous === undefined) delete process.env.OPENA2A_TELEMETRY;
+      else process.env.OPENA2A_TELEMETRY = previous;
+    }
   });
 
   test(
@@ -261,6 +286,16 @@ describe('scannerCommand and scannerSpawn', () => {
       [],
       { shell: true },
     ]);
+  });
+
+  test('on Windows quotes a word with a cmd.exe special character and escapes a double quote or %', () => {
+    const line = (word) => scannerSpawn(['node', word], 'win32')[0];
+    assert.equal(line('C:\\R&D|x^y (1)'), 'node "C:\\R&D|x^y (1)"');
+    assert.equal(line('C:\\a b\\'), 'node "C:\\a b\\\\"');
+    assert.equal(line(''), 'node ""');
+    assert.equal(line('C:\\a"b c\\x'), 'node ^"C:\\a\\^"b^ c\\x^"');
+    assert.equal(line('a\\"b'), 'node ^"a\\\\\\^"b^"');
+    assert.equal(line('C:\\100%\\%TEMP% & x'), 'node ^"C:\\100^%\\^%TEMP^%^ ^&^ x^"');
   });
 });
 
@@ -709,5 +744,21 @@ describe('command line', () => {
     const { stdout } = run(['--root', repoRoot], elsewhere);
     assert.ok(stdout.includes(` files in ${repoRoot} against `), stdout);
     assert.ok(!stdout.includes(' files in ..'), stdout);
+  });
+});
+
+describe('README.md', () => {
+  // npx runs a hackmyagent that is already installed, even an older release, unless the command
+  // asks for @latest, and without --yes it stops to ask before installing.
+  test('runs the published hackmyagent release in every npx hackmyagent command', () => {
+    const lines = readFileSync(join(repoRoot, 'README.md'), 'utf8').split('\n');
+    const commands = lines
+      .map((line, index) => [index + 1, line])
+      .filter(([, line]) => /\bnpx\b.*\bhackmyagent\b/.test(line));
+    assert.ok(commands.length > 0, 'README.md: no npx hackmyagent command found');
+    const unpinned = commands
+      .filter(([, line]) => !/\bnpx --yes hackmyagent@latest\s/.test(line))
+      .map(([number, line]) => `README.md:${number}: ${line.trim()}`);
+    assert.deepEqual(unpinned, []);
   });
 });
